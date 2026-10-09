@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from datetime import date
 from typing import Callable, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from .extract import NoteImage
 
@@ -435,11 +436,13 @@ def ollama_models() -> tuple[list[str], list[str]]:
         return [], []
 
 
-def ollama_prewarm(model: str) -> None:
-    """Keep model loaded in RAM so live generations don't suffer cold-load lag."""
+def ollama_prewarm(model: str, num_ctx: int = 2048) -> None:
+    """Keep model loaded in RAM so live generations don't suffer cold-load lag. Use the same num_ctx as
+    the real generations, otherwise Ollama reloads the model on the first request."""
     try:
         client = _ollama()
-        client.chat(model=model, messages=[{"role": "user", "content": "ping"}], keep_alive="24h")
+        client.chat(model=model, messages=[{"role": "user", "content": "ping"}], keep_alive="24h",
+                    options={"num_ctx": num_ctx, "num_predict": 1})
     except Exception:
         pass
 
@@ -459,57 +462,300 @@ def ollama_describe_images(model: str, images: list[NoteImage], on_status: Calla
         im.description = r["message"]["content"].strip()
 
 
-def ollama_easy_guide(model: str, filename: str, text: str, temperature: float, num_ctx: int,
-                      on_status: Callable[[str], None]) -> EasyGuide:
-    client = _ollama()
-    on_status("Writing your easy version on this computer…")
-    r = client.chat(
+# Long notes are written section by section with small schemas (a 1.5B model on CPU is slow at long
+# structured outputs and loses track of large inputs), then merged and given one short overview pass.
+LOCAL_CHUNK_CHARS = 6_000
+LOCAL_SECTION_TOKENS = 1_200
+LOCAL_OVERVIEW_TOKENS = 500
+
+
+class SectionGuide(BaseModel):
+    # Field order is generation order: the must-haves come first so the token cap only trims extras.
+    concepts: list[Concept]
+    flashcards: list[Flashcard]
+    practice: list[PracticeQuestion]
+    key_terms: list[KeyTerm]
+    cheat_sheet: list[str]
+    misconceptions: list[Misconception]
+    worked_examples: list[WorkedExample]
+    formulas: list[Formula]
+    gaps: list[Gap]
+
+
+class GuideOverview(BaseModel):
+    title: str
+    subject: str = Field(description="Course/subject, e.g. 'Data Structures & Algorithms'.")
+    big_picture: str = Field(description="3-5 sentences: what the lecture is about and how the pieces fit together.")
+    learning_goals: list[str] = Field(description="'You should be able to ...' items.")
+    connections: list[str] = Field(description="How the concepts relate; each one a full sentence.")
+
+
+class EasySection(BaseModel):
+    concepts: list[EasyConcept]
+    flashcards: list[Flashcard]
+    must_know: list[str]
+    quick_check: list[QuickCheck]
+    key_terms: list[KeyTerm]
+    dont_mix_up: list[str]
+    memory_tricks: list[MemoryTrick]
+    worked_examples: list[EasyWorkedExample]
+
+
+class EasyOverview(BaseModel):
+    title: str
+    one_sentence: str = Field(description="The whole lecture in one simple sentence.")
+    story: str = Field(description="The big picture as a short, friendly walkthrough, 3-5 short sentences.")
+    connections: list[str] = Field(description="How the key ideas relate, in plain words.")
+    top_three: list[str] = Field(description="If you only remember three things, remember these.")
+
+
+SECTION_CAPS = dict(concepts=3, flashcards=5, practice=2, key_terms=3, cheat_sheet=3, misconceptions=2,
+                    worked_examples=1, formulas=2, gaps=2)
+GUIDE_OVERVIEW_CAPS = dict(learning_goals=5, connections=5)
+EASY_SECTION_CAPS = dict(concepts=3, flashcards=5, must_know=3, quick_check=2, key_terms=3, dont_mix_up=2,
+                         memory_tricks=2, worked_examples=1)
+EASY_OVERVIEW_CAPS = dict(connections=4, top_three=3)
+
+SECTION_PROMPT = """You write ONE SECTION of a study reviewer from one part of a student's lecture notes.
+Use only facts from this part of the notes; reuse their own terms, examples, values and code.
+Explain WHY and HOW in plain words. Keep every field short.
+- concepts: up to 3 ideas this part teaches, in order. Each: explanation, why it matters, an example
+  from the notes ('' if none), the mistake students make ('' if none), source anchor.
+- key_terms: up to 3 terms with one-sentence definitions.
+- worked_examples: at most 1, only if the notes work through a problem or example; otherwise [].
+- formulas: only for math/science content; otherwise [].
+- misconceptions: up to 2 real confusions this part invites; otherwise [].
+- practice: up to 2 questions (Remember / Apply / Analyze) with answer and a short explanation.
+- cheat_sheet: up to 3 one-line facts.
+- gaps: things mentioned but not explained, with what to do; otherwise [].
+- flashcards: up to 5, one idea each, answer <= 25 words, plain text, never the '#' character.
+Cite anchors like "Page 3" or "Slide 5" in source fields. Plain text; formulas in Unicode, never LaTeX.
+"""
+
+GUIDE_OVERVIEW_PROMPT = """You are given the list of concepts a study reviewer covers and the start of the
+student's notes. Write the reviewer's title, subject, a short big picture (3-5 sentences), up to 5
+"You should be able to ..." learning goals and up to 5 sentences on how the concepts connect.
+Use only what is given. Plain text.
+"""
+
+EASY_SECTION_PROMPT = """You write ONE SECTION of an EASY-TO-DIGEST reviewer from one part of a student's
+lecture notes, for someone who is confused or cramming. Short sentences, everyday words, friendly tone;
+explain every technical word the moment it appears. Use only facts from this part of the notes
+(analogies are the only thing you may invent). Keep every field short.
+- concepts: up to 3 ideas, in order. Each: plain words, an everyday comparison, a tiny example from the
+  notes ('' if none), one line to remember, and a 1-2 sentence try-it scenario with its answer.
+- key_terms: up to 3 terms with plain definitions.
+- worked_examples: at most 1 simple example with 3-4 short steps; otherwise [].
+- must_know: up to 3 short facts most likely on the exam.
+- dont_mix_up: up to 2 confusing pairs, 'X is not Y: X ..., but Y ...'; otherwise [].
+- memory_tricks: up to 2 mnemonics or vivid images.
+- quick_check: up to 2 easy questions with a short answer plus 'because ...'.
+- flashcards: up to 5 simple cards, answer <= 15 words, plain text, never the '#' character.
+"""
+
+EASY_OVERVIEW_PROMPT = """You are given the list of ideas an easy study reviewer covers and the start of the
+student's notes. Write a title, the whole lecture in one simple sentence, a short friendly walkthrough
+(3-5 short sentences), up to 4 plain-words connections between the ideas, and the top 3 things to
+remember. Use only what is given. Short sentences, everyday words, plain text.
+"""
+
+
+def split_notes(text: str, size: int = LOCAL_CHUNK_CHARS) -> list[str]:
+    """Split notes into chunks of at most ~size chars at page/slide/paragraph boundaries. A chunk that
+    starts mid-page is told which page it continues so its source anchors stay right."""
+    text = (text or "").strip()
+    if len(text) <= size:
+        return [text]
+    blocks: list[str] = []
+    for block in re.split(r"\n\s*\n|\n(?=--- (?:Page|Slide) \d+ ---|===== FILE: )", text):
+        block = block.strip()
+        while len(block) > size:
+            cut = block.rfind("\n", 0, size)
+            if cut < size // 2:
+                cut = block.rfind(" ", 0, size)
+            if cut < size // 2:
+                cut = size
+            blocks.append(block[:cut].strip())
+            block = block[cut:].strip()
+        if block:
+            blocks.append(block)
+    chunks: list[str] = []
+    cur = ""
+    for block in blocks:
+        if cur and len(cur) + 2 + len(block) > size:
+            chunks.append(cur)
+            cur = ""
+        cur = f"{cur}\n\n{block}" if cur else block
+    if cur:
+        chunks.append(cur)
+    anchor = re.compile(r"--- (?:Page|Slide) \d+ ---")
+    for i in range(1, len(chunks)):
+        prev = anchor.findall(chunks[i - 1])
+        if prev and not chunks[i].startswith("---"):
+            chunks[i] = f"(continued from {prev[-1].strip('- ')})\n{chunks[i]}"
+    return chunks
+
+
+def _capped_schema(cls: type[BaseModel], caps: dict[str, int]) -> dict:
+    schema = cls.model_json_schema()
+    for field, n in caps.items():
+        schema["properties"][field]["maxItems"] = n
+    return schema
+
+
+def _close_json(raw: str) -> dict:
+    """Parse JSON that may have been cut off mid-way (output token cap): keep everything up to the last
+    completed object/array and close the open brackets."""
+    s = raw[raw.find("{"):] if "{" in raw else ""
+    stack: list[str] = []
+    in_str = esc = False
+    last_ok: tuple[int, list[str]] | None = None
+    for i, ch in enumerate(s):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]" and stack:
+            stack.pop()
+            if not stack:
+                return json.loads(s[: i + 1])
+            last_ok = (i, list(stack))
+    if last_ok is None:
+        return {}
+    i, still_open = last_ok
+    return json.loads(s[: i + 1] + "".join(reversed(still_open)))
+
+
+def _validate_lenient(cls: type[BaseModel], data: dict):
+    """Fill missing top-level fields and drop list items that are incomplete or malformed."""
+    data = dict(data) if isinstance(data, dict) else {}
+    for name, info in cls.model_fields.items():
+        if name not in data and info.is_required():
+            data[name] = "" if info.annotation is str else []
+    for _ in range(100):
+        try:
+            return cls.model_validate(data)
+        except ValidationError as e:
+            bad: dict[str, set[int]] = {}
+            for err in e.errors():
+                loc = err["loc"]
+                field = cls.model_fields.get(str(loc[0])) if loc else None
+                if len(loc) >= 2 and isinstance(loc[1], int) and isinstance(data.get(loc[0]), list):
+                    bad.setdefault(loc[0], set()).add(loc[1])
+                elif field is not None:
+                    data[loc[0]] = "" if field.annotation is str else []
+                else:
+                    raise
+            for name, idx in bad.items():
+                data[name] = [v for i, v in enumerate(data[name]) if i not in idx]
+    return cls.model_validate(data)
+
+
+def _parse_model(cls: type[BaseModel], raw: str):
+    try:
+        return cls.model_validate_json(raw)
+    except Exception:  # noqa: BLE001 — small models leave fields out or get cut off by the token cap
+        try:
+            data = _close_json(raw)
+        except Exception:  # noqa: BLE001
+            data = {}
+        return _validate_lenient(cls, data)
+
+
+def _ollama_json(model: str, system: str, user: str, cls: type[BaseModel], caps: dict[str, int],
+                 temperature: float, num_ctx: int, num_predict: int):
+    r = _ollama().chat(
         model=model,
-        messages=[{"role": "system", "content": EASY_PROMPT},
-                  {"role": "user", "content": _notes_block(filename, text, [], "none") + "\n\nReturn the EasyGuide JSON."}],
-        format=EasyGuide.model_json_schema(),
-        options={"temperature": max(temperature, 0.4), "num_ctx": num_ctx},
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        format=_capped_schema(cls, caps),
+        options={"temperature": temperature, "num_ctx": num_ctx, "num_predict": num_predict},
         keep_alive="24h",
     )
-    raw = r["message"]["content"]
-    try:
-        return EasyGuide.model_validate_json(raw)
-    except Exception:  # noqa: BLE001
-        data = json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
-        for k, v in dict(title=filename, one_sentence="", story="", concepts=[], worked_examples=[],
-                         must_know=[], dont_mix_up=[], memory_tricks=[], quick_check=[],
-                         top_three=[], flashcards=[]).items():
-            data.setdefault(k, v)
-        return EasyGuide.model_validate(data)
+    return _parse_model(cls, r["message"]["content"])
+
+
+def _dedupe(items: list, key: Callable[[object], str]) -> list:
+    seen: set[str] = set()
+    out = []
+    for it in items:
+        k = re.sub(r"\W+", "", key(it).lower())
+        if k and k not in seen:
+            seen.add(k)
+            out.append(it)
+    return out
+
+
+def _overview_input(filename: str, ideas: list[str], text: str) -> str:
+    listed = "\n".join(f"- {i}" for i in ideas)[:3_500]
+    return (f"Source file: {filename}\n\nIDEAS COVERED (in lecture order):\n{listed}\n\n"
+            f"START OF THE NOTES:\n<<<NOTES\n{text[:1_500]}\nNOTES>>>\n\nReturn the JSON.")
+
+
+def _write_sections(model: str, filename: str, text: str, images: list[NoteImage], system: str,
+                    cls: type[BaseModel], caps: dict[str, int], temperature: float, num_ctx: int,
+                    on_status: Callable[[str], None], what: str) -> list:
+    chunks = split_notes(text)
+    mode = "described" if any(i.description for i in images) else "none"
+    sections = []
+    for n, chunk in enumerate(chunks, 1):
+        on_status(f"Writing {what} on this computer — section {n} of {len(chunks)}…")
+        part = "" if len(chunks) == 1 else f"These notes are part {n} of {len(chunks)} of the file.\n"
+        user = _notes_block(filename, chunk, images if n == 1 else [], mode) + f"\n{part}\nReturn the section JSON."
+        sections.append(_ollama_json(model, system, user, cls, caps, temperature, num_ctx, LOCAL_SECTION_TOKENS))
+    return sections
+
+
+def ollama_easy_guide(model: str, filename: str, text: str, temperature: float, num_ctx: int,
+                      on_status: Callable[[str], None]) -> EasyGuide:
+    temperature = max(temperature, 0.4)
+    secs = _write_sections(model, filename, text, [], EASY_SECTION_PROMPT, EasySection, EASY_SECTION_CAPS,
+                           temperature, num_ctx, on_status, "your easy version")
+    concepts = _dedupe([c for s in secs for c in s.concepts], lambda c: c.name)
+    on_status("Pulling the sections together…")
+    ov = _ollama_json(model, EASY_OVERVIEW_PROMPT,
+                      _overview_input(filename, [f"{c.name}: {c.in_plain_words[:160]}" for c in concepts], text),
+                      EasyOverview, EASY_OVERVIEW_CAPS, temperature, num_ctx, LOCAL_OVERVIEW_TOKENS)
+    return EasyGuide(
+        title=ov.title or filename, one_sentence=ov.one_sentence, story=ov.story, concepts=concepts,
+        connections=ov.connections,
+        key_terms=_dedupe([k for s in secs for k in s.key_terms], lambda k: k.term),
+        worked_examples=[w for s in secs for w in s.worked_examples][:2],
+        must_know=_dedupe([m for s in secs for m in s.must_know], str),
+        dont_mix_up=_dedupe([d for s in secs for d in s.dont_mix_up], str),
+        memory_tricks=_dedupe([m for s in secs for m in s.memory_tricks], lambda m: m.trick),
+        quick_check=_dedupe([q for s in secs for q in s.quick_check], lambda q: q.question),
+        top_three=ov.top_three,
+        flashcards=[f for s in secs for f in s.flashcards],
+    )
 
 
 def ollama_study_guide(model: str, filename: str, text: str, images: list[NoteImage], temperature: float,
                        num_ctx: int, on_status: Callable[[str], None]) -> StudyGuide:
-    client = _ollama()
-    mode = "described" if any(i.description for i in images) else "none"
-    on_status("Writing your reviewer on this computer…")
-    stream = client.chat(
-        model=model,
-        messages=[{"role": "system", "content": WRITE_PROMPT},
-                  {"role": "user", "content": _notes_block(filename, text, images, mode)
-                   + "\n\nReturn the StudyGuide JSON."}],
-        format=StudyGuide.model_json_schema(),
-        options={"temperature": temperature, "num_ctx": num_ctx},
-        keep_alive="24h",
-        stream=True,
+    secs = _write_sections(model, filename, text, images, SECTION_PROMPT, SectionGuide, SECTION_CAPS,
+                           temperature, num_ctx, on_status, "your reviewer")
+    concepts = _dedupe([c for s in secs for c in s.concepts], lambda c: c.name)
+    on_status("Pulling the sections together…")
+    ov = _ollama_json(model, GUIDE_OVERVIEW_PROMPT,
+                      _overview_input(filename, [f"{c.name}: {c.explanation[:160]}" for c in concepts], text),
+                      GuideOverview, GUIDE_OVERVIEW_CAPS, temperature, num_ctx, LOCAL_OVERVIEW_TOKENS)
+    return StudyGuide(
+        title=ov.title or filename, subject=ov.subject, big_picture=ov.big_picture,
+        learning_goals=ov.learning_goals, concepts=concepts,
+        key_terms=_dedupe([k for s in secs for k in s.key_terms], lambda k: k.term),
+        connections=ov.connections,
+        worked_examples=[w for s in secs for w in s.worked_examples],
+        formulas=_dedupe([f for s in secs for f in s.formulas], lambda f: f.name),
+        misconceptions=[m for s in secs for m in s.misconceptions],
+        practice=[p for s in secs for p in s.practice],
+        cheat_sheet=_dedupe([c for s in secs for c in s.cheat_sheet], str),
+        gaps=_dedupe([g for s in secs for g in s.gaps], lambda g: g.term),
+        flashcards=[f for s in secs for f in s.flashcards],
     )
-    out: list[str] = []
-    for n, chunk in enumerate(stream):
-        out.append(chunk["message"]["content"])
-        if n % 200 == 0 and n:
-            on_status(f"Still writing… ({sum(map(len, out)):,} characters so far)")
-    raw = "".join(out)
-    try:
-        return StudyGuide.model_validate_json(raw)
-    except Exception:  # noqa: BLE001 — small models often leave fields out
-        data = json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
-        for k, v in dict(title=filename, subject="", big_picture="", learning_goals=[], concepts=[],
-                         key_terms=[], connections=[], worked_examples=[], practice=[],
-                         cheat_sheet=[], flashcards=[]).items():
-            data.setdefault(k, v)
-        return StudyGuide.model_validate(data)
