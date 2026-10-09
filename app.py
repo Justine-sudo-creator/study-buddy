@@ -91,11 +91,18 @@ def local_models():
     return engines.ollama_models()
 
 
+@st.cache_resource(show_spinner=False)
+def prewarm_local(model: str) -> None:
+    import threading
+
+    threading.Thread(target=engines.ollama_prewarm, args=(model, LOCAL_NUM_CTX), daemon=True).start()
+
+
 MAX_FILES = 20
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
 MAX_NOTE_CHARS_GEMINI = 200_000
-MAX_NOTE_CHARS_LOCAL = 4_000
-LOCAL_NUM_CTX = 2048
+MAX_NOTE_CHARS_LOCAL = 60_000
+LOCAL_NUM_CTX = 4096
 
 
 def saved_reviewers() -> list[dict]:
@@ -423,6 +430,9 @@ with tab_new:
     else:
         st.caption("Nothing leaves your computer, but the result is much simpler and can take 5–10 minutes. "
                    "Pictures in your notes are skipped.")
+        local, _ = local_models()
+        if local:
+            prewarm_local(LOCAL_MODEL if LOCAL_MODEL in local else local[0])
         if not GEMINI_KEY:
             st.info("Tip: add a free Gemini key (see Help) for much better reviewers that also read your diagrams.")
 
@@ -491,7 +501,12 @@ with tab_new:
         if not ex.text.strip() and not (online and include_pics and pics):
             st.warning("We couldn't find any text in these files. Use **Best quality** mode so the pictures can be read.")
         if not online and len(ex.text) > MAX_NOTE_CHARS_LOCAL:
-            st.info(f"⚡ Offline mode is tuned for standard laptops: focusing on the first {MAX_NOTE_CHARS_LOCAL:,} characters for fast, smooth local generation. For full-length textbooks, use Best quality mode.")
+            st.info(f"⚡ Offline mode reads the first {MAX_NOTE_CHARS_LOCAL:,} characters of your notes. "
+                    "For full-length textbooks, use Best quality mode.")
+        if not online and len(ex.text) > engines.LOCAL_CHUNK_CHARS:
+            n_sections = len(engines.split_notes(ex.text[:MAX_NOTE_CHARS_LOCAL]))
+            st.caption(f"Offline mode will work through your notes in {n_sections} sections "
+                       "and show progress as each one finishes.")
         if online and len(ex.text) > MAX_NOTE_CHARS_GEMINI:
             st.warning(f"Gemini mode can only read the first {MAX_NOTE_CHARS_GEMINI:,} characters of your notes.")
 
