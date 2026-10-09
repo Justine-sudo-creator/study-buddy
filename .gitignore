@@ -1,0 +1,31 @@
+# Environment variables and API keys (NEVER commit secrets)
+.env
+*.env
+!.env.example
+
+# Python virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Local reviewer and note outputs (generated at runtime)
+reviewers/*
+!reviewers/.gitkeep
+notes/*
+!notes/.gitkeep
+!notes/sample_notes.txt
+
+# Backup files
+*_backup.py
+*.bak
+
+# Operating System files
+.DS_Store
+Thumbs.db
