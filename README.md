@@ -16,6 +16,7 @@ In the Philippines and many regions worldwide, students face:
 
 ## 🚀 Key Features
 
+- **🧠 Offline Quiz Tutor ("Quiz me" tab):** Upload notes and get your first question in seconds. Type an answer in your own words and the local model grades it against the exact passage in your notes, with a one-line hint and a highlighted page/slide citation. Missed questions come back for review, and can be exported as Quizlet flashcards. Every model call is short (a few seconds on a CPU), so it stays responsive with Wi-Fi off.
 - **⚡ 100% Offline Generation:** Powered by local quantized models (Qwen2.5 1.5B via Ollama) running on standard CPU with under 4GB RAM footprint.
 - **📖 Dual Reviewer Modes:**
   - **Comprehensive Reviewer:** Deep concept breakdowns, "Don't Mix Up" distinctions, worked examples, formulas with LaTeX/Unicode math rendering, and practice questions.
@@ -83,7 +84,8 @@ pip install -r requirements.txt
 ### 3. Install & Start Ollama (For 100% Offline Mode)
 Install Ollama from [ollama.com](https://ollama.com), then pull the lightweight 1.5B model:
 ```bash
-ollama pull qwen2.5-coder:1.5b
+ollama pull qwen2.5:1.5b        # quiz tutor (set STUDY_QUIZ_MODEL to change)
+ollama pull qwen2.5-coder:1.5b  # offline reviewers (set STUDY_MODEL to change)
 ```
 
 ### 4. (Optional) Cloud Mode Configuration

@@ -11,9 +11,12 @@ from the "My reviewers" tab.
 
 from __future__ import annotations
 
+import hashlib
+import html
 import json
 import os
 import re
+import time
 from datetime import date, datetime
 from pathlib import Path
 
@@ -26,7 +29,7 @@ try:
 except ImportError:
     pass
 
-from study import engines, quality
+from study import engines, quality, tutor
 from study.extract import SUPPORTED, Extracted, NoteImage, combine, extract
 from study.pdf import easy_to_pdf, guide_to_pdf, pdf_to_images
 
@@ -53,6 +56,7 @@ def safe_stem(name: str) -> str:
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
 JEV_KEY = quality.jev_key()
 LOCAL_MODEL = os.environ.get("STUDY_MODEL", "qwen2.5-coder:1.5b")
+QUIZ_MODEL = os.environ.get("STUDY_QUIZ_MODEL", "qwen2.5:1.5b")
 
 st.set_page_config(page_title="Study Buddy", page_icon="📚", layout="wide")
 st.markdown(
@@ -62,6 +66,9 @@ st.markdown(
       .hero h1 {margin-bottom: 0;}
       .hero p {color: #6b7280; font-size: 1.05rem; margin-top: .25rem;}
       .step {font-weight: 600; font-size: 1.1rem; margin: 1.2rem 0 .3rem 0;}
+      .quiz-q {font-size: 1.5rem; font-weight: 600; margin: .4rem 0 .8rem 0;}
+      .quiz-src {line-height: 1.6;}
+      .quiz-src mark {background: #fef08a; padding: 0 .15rem;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -91,11 +98,18 @@ def local_models():
     return engines.ollama_models()
 
 
+@st.cache_resource(show_spinner=False)
+def prewarm_local(model: str) -> None:
+    import threading
+
+    threading.Thread(target=engines.ollama_prewarm, args=(model, LOCAL_NUM_CTX), daemon=True).start()
+
+
 MAX_FILES = 20
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
 MAX_NOTE_CHARS_GEMINI = 200_000
-MAX_NOTE_CHARS_LOCAL = 4_000
-LOCAL_NUM_CTX = 2048
+MAX_NOTE_CHARS_LOCAL = 60_000
+LOCAL_NUM_CTX = 4096
 
 
 def saved_reviewers() -> list[dict]:
@@ -389,14 +403,184 @@ def add_missing_version(it: dict) -> None:
                             st.rerun()
 
 
+
+# ---------------------------------------------------------------------------
+# Quiz (offline active-recall tutor)
+# ---------------------------------------------------------------------------
+VERDICT_LABEL = {"correct": "✅ Correct!", "partly": "🟡 Partly right", "incorrect": "❌ Not quite"}
+
+
+def pick_quiz_model(local: list[str]) -> str:
+    for m in (QUIZ_MODEL, LOCAL_MODEL):
+        if m in local:
+            return m
+    return local[0]
+
+
+def highlight(passage: str, answer: str) -> str:
+    """Passage as HTML with the sentence that best matches the answer highlighted."""
+    want = tutor._words(answer)
+    parts = re.split(r"(?<=[.!?])\s+|\n+", passage)
+    best = max(parts, key=lambda x: len(tutor._words(x) & want), default="")
+    out = []
+    for x in parts:
+        x_html = html.escape(x)
+        out.append(f"<mark>{x_html}</mark>" if x == best and want & tutor._words(x) else x_html)
+    return "<div class='quiz-src'>" + " ".join(out) + "</div>"
+
+
+@st.fragment(run_every=1.0)
+def quiz_waiting(qz: tutor.Quiz) -> None:
+    if qz.current() is not None or qz.error or qz.finished_writing:
+        st.rerun()
+    st.info(f"✍️ Writing your first questions on this computer… {time.time() - qz.started:.0f}s")
+
+
+@st.fragment(run_every=2.0)
+def quiz_status(qz: tutor.Quiz) -> None:
+    s = qz.stats()
+    c = st.columns(4)
+    c[0].metric("Questions ready", s["ready"])
+    c[1].metric("Answered", s["answered"])
+    c[2].metric("Right first try", s["first_try_correct"])
+    c[3].metric("Coming back for review", s["to_review"])
+    if qz.error:
+        st.error(f"Couldn't write more questions: {qz.error}")
+    elif qz.finished_writing:
+        st.caption(f"✅ Questions written for all {len(qz.passages)} parts of your notes.")
+    elif qz.writing:
+        st.caption(f"✍️ Writing more questions in the background — part {qz.next_passage + 1} of {len(qz.passages)} "
+                   "of your notes.")
+    else:
+        st.caption(f"⏸ {len(qz.queue)} questions waiting for you — more will be written as you go "
+                   f"({qz.next_passage} of {len(qz.passages)} parts covered).")
+
+
+def quiz_feedback(qz: tutor.Quiz, res: dict) -> None:
+    q = qz.questions[res["qid"]]
+    st.markdown(f"<div class='quiz-q'>{html.escape(q.question)}</div>", unsafe_allow_html=True)
+    if res["answer"]:
+        st.markdown(f"**You said:** {res['answer']}")
+    show = {"correct": st.success, "partly": st.warning, "incorrect": st.error}[res["verdict"]]
+    show(f"**{VERDICT_LABEL[res['verdict']]}** {res['hint']}".strip())
+    st.markdown(f"**From your notes:** {q.answer}")
+    with st.expander(f"📖 See it in your notes ({q.passage.where or 'your notes'})",
+                     expanded=res["verdict"] != "correct"):
+        st.markdown(highlight(q.passage.text, q.answer), unsafe_allow_html=True)
+    how = {"model": f"Checked in {res['secs']:.1f}s by {qz.model} on this computer — no internet used.",
+           "instant": "Checked instantly on this computer.",
+           "revealed": "Answer shown."}[res["how"]]
+    st.caption(how + ("" if res["verdict"] == "correct" else " 🔁 This one will come back in a few questions."))
+    if st.button("Next question ➜", type="primary", key=f"next_{q.id}_{len(qz.attempts.get(q.id, []))}"):
+        st.session_state.pop("quiz_result", None)
+        st.rerun()
+
+
+def quiz_card(qz: tutor.Quiz) -> None:
+    res = st.session_state.get("quiz_result")
+    if res:
+        quiz_feedback(qz, res)
+        return
+    q = qz.current()
+    if q is None:
+        if qz.error:
+            st.error(f"Couldn't write questions: {qz.error}")
+        elif qz.finished_writing:
+            if qz.questions:
+                st.success("🎉 You've answered every question correctly. Upload more notes or come back later!")
+            else:
+                st.warning("No questions could be made from these notes. Try notes with more text.")
+        else:
+            quiz_waiting(qz)
+        return
+    tries = len(qz.attempts.get(q.id, []))
+    st.markdown(f"**Question {len(qz.attempts) + (0 if tries else 1)}** · from *{q.passage.where or 'your notes'}*"
+                + (" · 🔁 review" if tries else ""))
+    st.markdown(f"<div class='quiz-q'>{html.escape(q.question)}</div>", unsafe_allow_html=True)
+    with st.form(f"ans_{q.id}_{tries}", clear_on_submit=True, border=False):
+        ans = st.text_area("Your answer", placeholder="Type it in your own words…", height=90)
+        c1, c2 = st.columns([2, 1])
+        submit = c1.form_submit_button("Check my answer", type="primary", use_container_width=True)
+        reveal = c2.form_submit_button("Show me the answer", use_container_width=True)
+    if not (submit or reveal):
+        return
+    t = time.time()
+    ans = ans.strip()
+    if reveal:
+        verdict, hint, how = "incorrect", "", "revealed"
+    elif quick := tutor.quick_verdict(ans, q.answer):
+        verdict, hint, how = quick, "", "instant"
+    else:
+        box = st.empty()
+        box.info("🧠 Checking your answer on this computer…")
+        verdict, hint = qz.grade(q, ans, lambda raw: box.info("🧠 " + (tutor.parse_grade(raw)[1] or "…")))
+        how = "model"
+    qz.record(q.id, verdict)
+    st.session_state["quiz_result"] = dict(qid=q.id, verdict=verdict, hint=hint, answer=ans,
+                                           secs=time.time() - t, how=how)
+    st.rerun()
+
+
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
 st.markdown("<div class='hero'><h1>📚 Study Buddy</h1>"
-            "<p>Upload your lecture notes and get a clear reviewer and flashcards made from them.</p></div>",
+            "<p>Upload your lecture notes and get quizzed on them — your answers are checked on this computer, no internet needed.</p></div>",
             unsafe_allow_html=True)
 
-tab_new, tab_saved, tab_help = st.tabs(["✨ New reviewer", "📁 My reviewers", "❓ Help"])
+tab_quiz, tab_new, tab_saved, tab_help = st.tabs(["🧠 Quiz me", "✨ New reviewer", "📁 My reviewers", "❓ Help"])
+
+# ---------------------------------------------------------------------------
+# Quiz me
+# ---------------------------------------------------------------------------
+with tab_quiz:
+    qups = st.file_uploader("Upload your notes — PDF, Word, PowerPoint, Excel or text", type=SUPPORTED,
+                            accept_multiple_files=True, key="quiz_files",
+                            help="Your files are only read on this computer. They aren't stored.")
+    local, _ = local_models()
+    if not local:
+        st.error(f"The offline AI isn't running. Start it with `ollama serve`, then run `ollama pull {QUIZ_MODEL}`.")
+    else:
+        qmodel = pick_quiz_model(local)
+        prewarm_local(qmodel)
+        st.caption(f"🔒 100% on this computer with **{qmodel}** — your notes never leave it, and it works with "
+                   "Wi-Fi off.")
+        if QUIZ_MODEL not in local:
+            st.caption(f"Tip: run `ollama pull {QUIZ_MODEL}` for better questions.")
+    if qups and local:
+        qparts, qbad = [], []
+        for f in qups[:MAX_FILES]:
+            try:
+                qparts.append((f.name, read_file(f.name, f.getvalue())))
+            except Exception as e:  # noqa: BLE001
+                qbad.append(f"{f.name} ({e})")
+        for b in qbad:
+            st.error(f"Sorry, this file couldn't be opened: {b}")
+        if qparts:
+            qtext = combine(qparts).text[:MAX_NOTE_CHARS_LOCAL]
+            qkey = hashlib.sha1(f"{qmodel}\n{qtext}".encode()).hexdigest()
+            qz = st.session_state.get("quiz")
+            if qz is None or st.session_state.get("quiz_key") != qkey:
+                if qz is not None:
+                    qz.stop.set()
+                qz = tutor.Quiz(qmodel, tutor.passages(qtext))
+                qz.start()
+                st.session_state.update(quiz=qz, quiz_key=qkey)
+                st.session_state.pop("quiz_result", None)
+            label = qparts[0][0] if len(qparts) == 1 else f"{len(qparts)} files"
+            st.success(f"**{label}** — about {len(qtext.split()):,} words in {len(qz.passages)} parts")
+            quiz_status(qz)
+            st.divider()
+            quiz_card(qz)
+            missed = qz.missed()
+            if missed:
+                st.divider()
+                st.download_button(
+                    f"⬇️ Download the {len(missed)} questions you missed as flashcards (Quizlet)",
+                    "\n".join(f"{q.question}\t{q.answer}" for q in missed),
+                    file_name="Missed_questions_Quizlet.txt", key="quiz_missed_dl")
+    elif not qups:
+        st.info("👆 Upload your notes. Your first question will be ready in about 15 seconds.")
 
 # ---------------------------------------------------------------------------
 # New reviewer
@@ -423,6 +607,9 @@ with tab_new:
     else:
         st.caption("Nothing leaves your computer, but the result is much simpler and can take 5–10 minutes. "
                    "Pictures in your notes are skipped.")
+        local, _ = local_models()
+        if local:
+            prewarm_local(LOCAL_MODEL if LOCAL_MODEL in local else local[0])
         if not GEMINI_KEY:
             st.info("Tip: add a free Gemini key (see Help) for much better reviewers that also read your diagrams.")
 
@@ -491,7 +678,12 @@ with tab_new:
         if not ex.text.strip() and not (online and include_pics and pics):
             st.warning("We couldn't find any text in these files. Use **Best quality** mode so the pictures can be read.")
         if not online and len(ex.text) > MAX_NOTE_CHARS_LOCAL:
-            st.info(f"⚡ Offline mode is tuned for standard laptops: focusing on the first {MAX_NOTE_CHARS_LOCAL:,} characters for fast, smooth local generation. For full-length textbooks, use Best quality mode.")
+            st.info(f"⚡ Offline mode reads the first {MAX_NOTE_CHARS_LOCAL:,} characters of your notes. "
+                    "For full-length textbooks, use Best quality mode.")
+        if not online and len(ex.text) > engines.LOCAL_CHUNK_CHARS:
+            n_sections = len(engines.split_notes(ex.text[:MAX_NOTE_CHARS_LOCAL]))
+            st.caption(f"Offline mode will work through your notes in {n_sections} sections "
+                       "and show progress as each one finishes.")
         if online and len(ex.text) > MAX_NOTE_CHARS_GEMINI:
             st.warning(f"Gemini mode can only read the first {MAX_NOTE_CHARS_GEMINI:,} characters of your notes.")
 
